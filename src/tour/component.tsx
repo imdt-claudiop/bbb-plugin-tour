@@ -1,18 +1,26 @@
-/* eslint-disable global-require */
-/* eslint-disable import/no-dynamic-require */
 import * as React from 'react';
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
+import { flushSync } from 'react-dom';
+import { createRoot, Root } from 'react-dom/client';
 import Shepherd from 'shepherd.js';
-import { IntlShape, createIntl, defineMessages } from 'react-intl';
+import type Evented from 'shepherd.js/src/types/evented';
+import {
+  IntlShape, createIntl, createIntlCache, defineMessages,
+} from 'react-intl';
 import {
   BbbPluginSdk, OptionsDropdownOption, PluginApi,
-  pluginLogger, IntlLocaleUiDataNames,
-  LayoutPresentationAreaUiDataNames, UiLayouts,
+  pluginLogger, LayoutPresentationAreaUiDataNames, UiLayouts,
 } from 'bigbluebutton-html-plugin-sdk';
 import { TourPluginProps, Settings, ClientSettingsSubscriptionResultType } from './types';
+import { LOCALE_REQUEST_OBJECT } from './constants';
 import getTourFeatures from './getTourFeatures';
+import { SidebarState, getSidebarState, restoreSidebar } from './sidebar';
+import TourStepContent from './step-content/component';
+import ShepherdStyle from './styles';
 import 'shepherd.js/dist/css/shepherd.css';
-import './custom.css';
+
+// shepherd.js 11.x types omit the Evented methods its default export has at runtime
+const ShepherdEvents = Shepherd as unknown as Evented;
 
 export const CLIENT_SETTINGS_SUBSCRIPTION = `subscription ClientSettings {
   meeting_clientSettings {
@@ -25,7 +33,23 @@ const intlMessages = defineMessages({
     id: 'app.tour.startTour',
     description: 'start tour button label',
   },
+  close: {
+    id: 'app.tour.button.close',
+    description: 'close tour button label',
+  },
 });
+
+// The client can hand over tags Intl rejects, such as en-US@posix from a POSIX
+// browser locale, and createIntl throws on those, so use the first valid one
+const toIntlLocale = (...locales: (string | undefined)[]): string => locales.find((locale) => {
+  if (!locale) return false;
+  try {
+    Intl.NumberFormat.supportedLocalesOf(locale);
+    return true;
+  } catch {
+    return false;
+  }
+}) ?? 'en';
 
 /**
  * Starts the tour with the steps defined by getTourFeatures()
@@ -34,20 +58,19 @@ const intlMessages = defineMessages({
  */
 export function startTour(
   intl: IntlShape,
-  URLS: object,
+  URLS: Settings['url'],
   pluginApi: PluginApi,
   presentationInitiallyOpened: boolean,
 ) {
   // Docs: https://docs.shepherdpro.com/guides/usage/
   const tour = new Shepherd.Tour({
     defaultStepOptions: {
-      cancelIcon: {
-        enabled: true,
-      },
       canClickTarget: false,
     },
     useModalOverlay: true,
   });
+
+  const stepRoots: Root[] = [];
 
   getTourFeatures(
     intl,
@@ -56,16 +79,51 @@ export function startTour(
     pluginApi,
     presentationInitiallyOpened,
   ).forEach((feature) => {
-    feature.steps.forEach((step) => {
+    feature.steps.forEach(({
+      title, text, buttons = [], ...step
+    }) => {
+      const titleId = `${step.id}-title`;
+      const stepContainer = document.createElement('div');
+      const stepRoot = createRoot(stepContainer);
+      // Shepherd collects a step's focusable elements for its Tab trap when the
+      // step mounts, so the buttons must be in the DOM before the tour starts
+      flushSync(() => stepRoot.render(
+        <TourStepContent
+          title={title}
+          titleId={titleId}
+          text={text}
+          buttons={buttons}
+          closeLabel={intl.formatMessage(intlMessages.close)}
+          onClose={() => tour.cancel()}
+        />,
+      ));
+      stepRoots.push(stepRoot);
+
       tour.addStep({
         ...step,
+        text: stepContainer,
+        when: {
+          ...step.when,
+          // Shepherd only labels the dialog with a title it renders itself
+          show() {
+            if (title) this.getElement()?.setAttribute('aria-labelledby', titleId);
+            step.when?.show?.call(this);
+          },
+        },
         // Only show step if the element is visible
         showOn: () => !!document.querySelector(
           step.attachTo.element,
         ),
-      } as Parameters<typeof tour.addStep>[0]);
+      });
     });
   });
+
+  // Deferred because the tour ends from a click handler inside one of these roots
+  const unmountStepRoots = () => queueMicrotask(
+    () => stepRoots.forEach((stepRoot) => stepRoot.unmount()),
+  );
+  tour.on('complete', unmountStepRoots);
+  tour.on('cancel', unmountStepRoots);
 
   tour.start();
 }
@@ -76,12 +134,8 @@ function TourPlugin(
   BbbPluginSdk.initialize(uuid);
   const pluginApi: PluginApi = BbbPluginSdk.getPluginApi(uuid);
   const [presentationInitiallyOpened, setPresentationInitiallyOpened] = React.useState(true);
+  const sidebarInitialState = React.useRef<SidebarState>({});
   const [settings, setSettings] = React.useState<Settings>({});
-
-  const currentLocale = pluginApi.useUiData(IntlLocaleUiDataNames.CURRENT_LOCALE, {
-    locale: 'en',
-    fallbackLocale: 'en',
-  });
 
   const layoutInformation = pluginApi.useUiData(
     LayoutPresentationAreaUiDataNames.CURRENT_ELEMENT,
@@ -99,34 +153,35 @@ function TourPlugin(
     ClientSettingsSubscriptionResultType
   >(CLIENT_SETTINGS_SUBSCRIPTION);
 
-  let messages = {};
-  try {
-    messages = require(`../locales/${currentLocale.locale.replace('-', '_')}.json`);
-  } catch {
-    messages = require(`../locales/${currentLocale.fallbackLocale.replace('-', '_')}.json`);
-  }
-
-  const intl = createIntl({
-    locale: currentLocale.locale,
-    messages,
-    fallbackOnEmptyString: true,
-  });
-
   useEffect(() => {
     const plugins = clientSettings?.meeting_clientSettings[0]?.clientSettingsJson?.public?.plugins;
-    const tourPlugin = plugins?.find((plugin) => plugin.name === 'TourPlugin');
+    // 4.0 servers set up before the rename configure the plugin as TourPlugin
+    const tourPlugin = plugins?.find((plugin) => plugin.name === 'BbbPluginTour')
+      ?? plugins?.find((plugin) => plugin.name === 'TourPlugin');
     if (tourPlugin && tourPlugin?.settings) {
       setSettings(tourPlugin.settings);
     }
   }, [clientSettings]);
 
+  const {
+    messages,
+    currentLocale,
+    loading: localeLoading,
+  } = pluginApi.useLocaleMessages(LOCALE_REQUEST_OBJECT);
+
+  const intlCache = useMemo(() => createIntlCache(), []);
+  const intl = useMemo(() => (localeLoading ? null : createIntl({
+    locale: toIntlLocale(currentLocale),
+    messages,
+    fallbackOnEmptyString: true,
+  }, intlCache)), [localeLoading, messages, currentLocale, intlCache]);
+
   useEffect(() => {
     const endTourEvents = ['cancel', 'complete'];
 
-    // restores the panel state after finishing the tour
-    endTourEvents.forEach((event) => Shepherd.on(event, () => {
-      // reopen sidebar
-      pluginApi.uiCommands.sidekickOptionsContainer.open();
+    endTourEvents.forEach((event) => ShepherdEvents.on(event, () => {
+      // restores the navigation rail and panel after finishing the tour (mobile only)
+      restoreSidebar(pluginApi, sidebarInitialState.current);
       // restores presentation state after finishing the tour
       if (presentationInitiallyOpened !== layoutInformation[0]?.isOpen) {
         if (presentationInitiallyOpened) {
@@ -136,27 +191,26 @@ function TourPlugin(
         }
       }
       // removes events
-      endTourEvents.forEach((event) => Shepherd.off(event, undefined));
+      endTourEvents.forEach((endEvent) => ShepherdEvents.off(endEvent, undefined));
     }));
     return () => {
       // removes events
-      endTourEvents.forEach((event) => Shepherd.off(event, undefined));
+      endTourEvents.forEach((event) => ShepherdEvents.off(event, undefined));
     };
   }, [layoutInformation]);
 
   useEffect(() => {
+    if (!intl) return;
     pluginApi.setOptionsDropdownItems([
       new OptionsDropdownOption({
         label: intl.formatMessage(intlMessages.start),
         icon: 'presentation',
         onClick: async () => {
           setPresentationInitiallyOpened(layoutInformation[0]?.isOpen);
+          sidebarInitialState.current = getSidebarState();
           pluginLogger.info({
             logCode: 'plg_started',
           }, `Plugin started: ${pluginApi.pluginName}`);
-          // ensure only userList is open (to also work on Mobile)
-          pluginApi.uiCommands.sidekickOptionsContainer.close();
-          pluginApi.uiCommands.sidekickOptionsContainer.open();
           // ensure presentation is open before start (it will be closed after)
           pluginApi.uiCommands.presentationArea.open();
           // wait some time for the ui to update
@@ -170,9 +224,9 @@ function TourPlugin(
         },
       }),
     ]);
-  }, [currentLocale, settings, layoutInformation]);
+  }, [intl, settings, layoutInformation]);
 
-  return null;
+  return <ShepherdStyle />;
 }
 
 export default TourPlugin;

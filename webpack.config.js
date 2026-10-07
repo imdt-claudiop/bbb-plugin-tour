@@ -5,8 +5,8 @@ const path = require('path');
 module.exports = {
   entry: './src/index.tsx',
   output: {
-    filename: 'TourPlugin.js',
-    library: 'TourPlugin',
+    filename: 'BbbPluginTour.js',
+    library: 'BbbPluginTour',
     libraryTarget: 'umd',
     publicPath: '/',
     globalObject: 'this',
@@ -14,9 +14,14 @@ module.exports = {
   devServer: {
     allowedHosts: 'all',
     port: 4701,
-    host: 'localhost',
+    host: '0.0.0.0',
     hot: false,
     liveReload: false,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
+      'Access-Control-Allow-Headers': 'X-Requested-With, content-type, Authorization, ngrok-skip-browser-warning',
+    },
     client: {
       overlay: false,
     },
@@ -36,13 +41,6 @@ module.exports = {
   module: {
     rules: [
       {
-        test: /\.(js|jsx)$/,
-        exclude: /node_modules/,
-        use: {
-          loader: 'babel-loader',
-        },
-      },
-      {
         test: /\.css$/,
         use: ['style-loader', 'css-loader'],
       },
@@ -60,6 +58,7 @@ module.exports = {
     new CopyWebpackPlugin({
       patterns: [
         { from: 'manifest.json', to: './' }, // Copy manifest.json to static/ in the output folder
+        { from: 'public/locales/', to: './locales/' }, // Copy all locales to the output folder
       ],
     }),
   ],
